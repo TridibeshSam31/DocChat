@@ -3,7 +3,7 @@ import asyncHandler from "../utils/asyncHandler.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { ApiError } from "../utils/ApiError.js";
 import { scrapeWebpage } from "../utils/ragUtilities.js";
-import { cleanupQdrantCollections } from "../utils/qdrantCleanup.js";
+import { cleanupQdrantCollections, deleteQdrantCollectionSafe } from "../utils/qdrantCleanup.js";
 import { Queue } from "bullmq";
 import redis from "../utils/redis.js";
 import crypto from "crypto";
@@ -482,27 +482,71 @@ const cancelProcessing = asyncHandler(async (req, res) => {
 const deleteChat = asyncHandler(async (req, res) => {
     const { chatId } = req.params;
 
-    const chatMessages = await prisma.chatMessage.findMany({
-        where: { chatId },
-    });
-    for await (const message of chatMessages) {
-        await prisma.chatMessageSource.deleteMany({
-            where: { chatMessageId: message.id },
-        });
-    }
-    await prisma.chatMessage.deleteMany({
-        where: { chatId },
-    });
-    const chat = await prisma.chat.delete({
+    const chat = await prisma.chat.findUnique({
         where: { id: chatId },
+        select: {
+            id: true,
+            userId: true,
+            chatSources: { select: { id: true, collectionName: true } },
+        },
     });
 
     if (!chat) {
         throw new ApiError(404, "Chat not found");
     }
 
-    res.status(200).json(new ApiResponse(200, null, "Chat deleted successfully"));
+    if (chat.userId !== req.user.id) {
+        throw new ApiError(403, "You do not have permission to delete this chat");
+    }
+
+    const chatSourceIds = chat.chatSources.map((s) => s.id);
+
+    let exclusiveSourceIds = [];
+    await prisma.$transaction(async (tx) => {
+        await tx.chatMessageSource.deleteMany({
+            where: { chatMessage: { chatId } },
+        });
+
+        await tx.chatMessage.deleteMany({
+            where: { chatId },
+        });
+
+        await tx.chat.delete({
+            where: { id: chatId },
+        });
+
+        if (chatSourceIds.length > 0) {
+            const stillReferenced = await tx.chatSource.findMany({
+                where: {
+                    id: { in: chatSourceIds },
+                    chats: { some: {} }, // at least one chat still connected
+                },
+                select: { id: true },
+            });
+            const stillReferencedIds = new Set(stillReferenced.map((s) => s.id));
+            exclusiveSourceIds = chatSourceIds.filter((id) => !stillReferencedIds.has(id));
+
+            if (exclusiveSourceIds.length > 0) {
+                await tx.chatSource.deleteMany({
+                    where: { id: { in: exclusiveSourceIds } },
+                });
+            }
+        }
+    });
+
+    const qdrantResults = [];
+    for (const source of chat.chatSources) {
+        if (exclusiveSourceIds.includes(source.id) && source.collectionName) {
+            const result = await deleteQdrantCollectionSafe(source.collectionName);
+            qdrantResults.push({ collectionName: source.collectionName, ...result });
+        }
+    }
+
+    res.status(200).json(
+        new ApiResponse(200, { qdrantCleanup: qdrantResults }, "Chat deleted successfully"),
+    );
 });
+
 
 const toggleShare = asyncHandler(async (req, res) => {
     const { chatId } = req.params;
