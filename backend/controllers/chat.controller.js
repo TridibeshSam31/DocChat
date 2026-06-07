@@ -3,7 +3,7 @@ import asyncHandler from "../utils/asyncHandler.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { ApiError } from "../utils/ApiError.js";
 import { scrapeWebpage } from "../utils/ragUtilities.js";
-import { cleanupQdrantCollections, deleteQdrantCollectionSafe } from "../utils/qdrantCleanup.js";
+import { cleanupQdrantCollections } from "../utils/qdrantCleanup.js";
 import { Queue } from "bullmq";
 import redis from "../utils/redis.js";
 import crypto from "crypto";
@@ -487,7 +487,6 @@ const deleteChat = asyncHandler(async (req, res) => {
         select: {
             id: true,
             userId: true,
-            chatSources: { select: { id: true, collectionName: true } },
         },
     });
 
@@ -499,9 +498,6 @@ const deleteChat = asyncHandler(async (req, res) => {
         throw new ApiError(403, "You do not have permission to delete this chat");
     }
 
-    const chatSourceIds = chat.chatSources.map((s) => s.id);
-
-    let exclusiveSourceIds = [];
     await prisma.$transaction(async (tx) => {
         await tx.chatMessageSource.deleteMany({
             where: { chatMessage: { chatId } },
@@ -515,35 +511,14 @@ const deleteChat = asyncHandler(async (req, res) => {
             where: { id: chatId },
         });
 
-        if (chatSourceIds.length > 0) {
-            const stillReferenced = await tx.chatSource.findMany({
-                where: {
-                    id: { in: chatSourceIds },
-                    chats: { some: {} }, // at least one chat still connected
-                },
-                select: { id: true },
-            });
-            const stillReferencedIds = new Set(stillReferenced.map((s) => s.id));
-            exclusiveSourceIds = chatSourceIds.filter((id) => !stillReferencedIds.has(id));
-
-            if (exclusiveSourceIds.length > 0) {
-                await tx.chatSource.deleteMany({
-                    where: { id: { in: exclusiveSourceIds } },
-                });
-            }
-        }
+        // ChatSource rows (and their DocumentTree / DocumentPage children) are
+        // intentionally left intact — they may be shared by other chats, and the
+        // Qdrant collection they reference is preserved so no data is lost.
+        // Orphaned collections are cleaned up by the admin Qdrant sweep.
     });
 
-    const qdrantResults = [];
-    for (const source of chat.chatSources) {
-        if (exclusiveSourceIds.includes(source.id) && source.collectionName) {
-            const result = await deleteQdrantCollectionSafe(source.collectionName);
-            qdrantResults.push({ collectionName: source.collectionName, ...result });
-        }
-    }
-
     res.status(200).json(
-        new ApiResponse(200, { qdrantCleanup: qdrantResults }, "Chat deleted successfully"),
+        new ApiResponse(200, null, "Chat deleted successfully"),
     );
 });
 
